@@ -119,17 +119,19 @@ deck main 3     # make window #3 the big master pane (one-shot, no daemon)
 
 ## Auto-start on login
 
-Want `follow` always on? Create a LaunchAgent:
+Want `follow` always on? Create a LaunchAgent (this auto-fills your install
+path via `command -v deck`):
 
 ```bash
+DECK="$(command -v deck)"
 mkdir -p ~/Library/LaunchAgents
-cat > ~/Library/LaunchAgents/com.deck.follow.plist <<'PLIST'
+cat > ~/Library/LaunchAgents/com.deck.follow.plist <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.deck.follow</string>
   <key>ProgramArguments</key>
-  <array><string>/usr/local/bin/deck</string><string>follow</string><string>--fg</string></array>
+  <array><string>$DECK</string><string>follow</string><string>--fg</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict></plist>
@@ -137,7 +139,6 @@ PLIST
 launchctl load ~/Library/LaunchAgents/com.deck.follow.plist
 ```
 
-(Adjust the path if you installed `deck` somewhere other than `/usr/local/bin`.)
 Remove it with `launchctl unload ~/Library/LaunchAgents/com.deck.follow.plist`.
 
 ---
