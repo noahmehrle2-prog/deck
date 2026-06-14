@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# deck runtime files (created at ~ in real use; ignored here just in case)
+.deck-follow.pid
+.deck-follow.log
+.deck-dashboard.html
+
+# python
+__pycache__/
+*.pyc
+
+# editor cruft
+*.swp
+*~

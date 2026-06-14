@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+deck — a clean overview, tiler, and click-to-enlarge for macOS Terminal.app.
+
+When you have a pile of overlapping Terminal windows (great for juggling many
+Claude Code / AI-agent sessions), deck lays them out so you can see and click
+every one — and optionally swaps whichever you click into a big working pane.
+
+Each window shows up with:
+  • a live status   (working / waiting / shell)  read from the title glyph
+  • how long idle   (no output to that tty)
+  • the window task  (e.g. the title Claude Code set)
+  • what's running   (claude, caffeinate, node, plain shell ...)
+
+USAGE
+  deck                  Print a clean table of all Terminal windows (default)
+  deck tile [cols]      Arrange every window into a tidy grid so they're all
+                        visible and clickable (no overlap). Optional column
+                        count, e.g. 'deck tile 4'
+  deck stack            Cascade windows diagonally (every title bar readable)
+  deck follow [pct]     Turn ON click-to-enlarge (runs in the BACKGROUND):
+                        click any small window and it swaps into the big pane
+                        you type in. Optional pct = big-pane width ('follow 75')
+  deck follow stop      Turn it off        (aliases: 'deck stop', 'deck unfollow')
+  deck follow status    Is it on?
+  deck main [n]         One-shot: make window #n (or the front one) big now
+  deck go <n>           Bring window number <n> to the front
+  deck watch [N]        Live auto-refreshing table (default every 2 seconds)
+  deck html [watch]     Build a browser dashboard and open it
+  deck help             This help
+  deck version          Print version
+
+No dependencies beyond Python 3. No server, no config. Pure AppleScript control.
+Project: https://github.com/noahmehrle2-prog/deck
+"""
+
+import os
+import re
+import sys
+import math
+import time
+import shutil
+import signal
+import subprocess
+
+VERSION = "1.0.0"
+
+HTML_PATH = os.path.expanduser("~/.deck-dashboard.html")
+PID_PATH = os.path.expanduser("~/.deck-follow.pid")
+LOG_PATH = os.path.expanduser("~/.deck-follow.log")
+
+# ---- glyph classification ------------------------------------------------
+# Claude Code paints the terminal title with a spinner while working and a
+# sparkle while it's idle/waiting for you. We read that glyph to get status.
+# (Non-Claude windows simply fall back to "shell" — tiling works regardless.)
+WAITING_GLYPHS = set("✳✶✻✽✺✦✱❋✷✸✹✴❂✵✲✫✬")
+
+
+def classify(glyph, proc, task):
+    """Return one of: working, waiting, shell, busy."""
+    is_claude = "claude" in (proc + " " + task).lower()
+    if glyph:
+        c = ord(glyph[0])
+        if 0x2800 <= c <= 0x28FF:          # Braille block = spinner = working
+            return "working" if is_claude else "busy"
+        if glyph[0] in WAITING_GLYPHS:     # sparkle = idle/ready
+            return "waiting" if is_claude else "busy"
+    if is_claude:
+        return "waiting"
+    return "shell"
+
+
+# ---- data acquisition ----------------------------------------------------
+OSA_LIST = r'''
+tell application "Terminal"
+  set out to ""
+  repeat with w in windows
+    set tlist to ""
+    repeat with t in tabs of w
+      try
+        set tlist to tlist & (tty of t) & ","
+      end try
+    end repeat
+    set out to out & (id of w) & "§" & tlist & "§" & (name of w) & linefeed
+  end repeat
+  return out
+end tell
+'''
+
+
+def osa(script):
+    try:
+        r = subprocess.run(["osascript", "-"], input=script,
+                            capture_output=True, text=True, timeout=15)
+        return r.stdout
+    except Exception:
+        return ""
+
+
+def idle_of(tty):
+    try:
+        return time.time() - os.stat(tty).st_mtime
+    except Exception:
+        return None
+
+
+def short_proc(proc):
+    """Compress the process chain into a short, friendly label."""
+    p = proc.lower()
+    if "claude" in p:
+        label = "claude"
+        if "--resume" in p:
+            label = "claude (resumed)"
+        extras = ""
+        if "caffeinate" in p:
+            extras += " ☕"          # kept awake
+        if "sourcekit-lsp" in p or "xcode" in p:
+            extras += " ⚙"          # swift LSP attached
+        return label + extras
+    # plain shell or other foreground command: show the leaf command word
+    chain = re.split(r"\s*◂\s*", proc)
+    leaf = chain[0].strip() if chain else proc.strip()
+    leaf = leaf.lstrip("-")
+    return (leaf.split() or ["shell"])[0] or "shell"
+
+
+def collect():
+    """Return list of dicts sorted by window id (stable numbering)."""
+    rows = []
+    for line in osa(OSA_LIST).splitlines():
+        if "§" not in line:
+            continue
+        parts = line.split("§")
+        if len(parts) < 3:
+            continue
+        try:
+            wid = int(parts[0])
+        except ValueError:
+            continue
+        ttys = [t for t in parts[1].split(",") if t.strip()]
+        name = parts[2]
+
+        # Terminal names look like "user — <glyph> <task> — <proc> — <WxH>".
+        # We only rely on this for the pretty table; tiling needs just id+name.
+        segs = name.split(" — ")
+        title = segs[1].strip() if len(segs) >= 2 else segs[0].strip()
+        dims, proc = "", ""
+        if len(segs) >= 3:
+            if re.match(r"^\d+×\d+$", segs[-1].strip()):
+                dims = segs[-1].strip()
+                proc = " — ".join(segs[2:-1]).strip()
+            else:
+                proc = " — ".join(segs[2:]).strip()
+
+        glyph = ""
+        task = title
+        if title and not title[0].isalnum() and title[0] not in "/.~_-":
+            glyph = title.split(" ", 1)[0]
+            task = title[len(glyph):].strip() or title
+
+        status = classify(glyph, proc, task)
+
+        # pick the first stat-able tty for idle
+        idle = None
+        tty = ttys[0] if ttys else ""
+        for cand in ttys:
+            i = idle_of(cand)
+            if i is not None:
+                idle, tty = i, cand
+                break
+
+        rows.append({
+            "wid": wid, "tty": tty, "task": task or "(untitled)",
+            "proc": short_proc(proc), "rawproc": proc,
+            "status": status, "idle": idle, "dims": dims,
+        })
+    rows.sort(key=lambda r: r["wid"])
+    for n, r in enumerate(rows, 1):
+        r["n"] = n
+    return rows
+
+
+# ---- formatting helpers --------------------------------------------------
+def fmt_idle(s):
+    if s is None:
+        return "—"
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d"
+
+
+STATUS_META = {        # label, ansi color, dot
+    "working": ("working", "92", "●"),   # green
+    "waiting": ("waiting", "93", "◌"),   # yellow
+    "busy":    ("busy",    "96", "●"),   # cyan
+    "shell":   ("shell",   "90", "·"),   # dim grey
+    "other":   ("other",   "90", "·"),
+}
+
+
+def c(text, code, on):
+    return f"\033[{code}m{text}\033[0m" if on else text
+
+
+# ---- table renderer ------------------------------------------------------
+def render_table(rows, color):
+    if not rows:
+        return "No open Terminal windows found.\n"
+    width = shutil.get_terminal_size((100, 24)).columns
+    n_w = max(2, len(str(len(rows))))
+    st_w = 10
+    id_w = 6
+    proc_w = 18
+    fixed = n_w + 2 + st_w + 2 + id_w + 2 + proc_w + 2
+    task_w = max(20, width - fixed - 2)
+
+    out = []
+    head = (f"{'#':>{n_w}}  {'STATUS':<{st_w}}  {'IDLE':<{id_w}}  "
+            f"{'SESSION':<{task_w}}  {'RUNNING':<{proc_w}}")
+    out.append(c(head, "1;97", color))
+    out.append(c("─" * min(width, len(head)), "90", color))
+
+    counts = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        label, col, dot = STATUS_META.get(r["status"], STATUS_META["other"])
+        st = f"{dot} {label}"
+        st_pad = st + " " * max(0, st_w - len(label) - 2)
+        task = r["task"]
+        if len(task) > task_w:
+            task = task[: task_w - 1] + "…"
+        idle = fmt_idle(r["idle"])
+        proc = r["proc"]
+        if len(proc) > proc_w:
+            proc = proc[: proc_w - 1] + "…"
+        line = (f"{r['n']:>{n_w}}  {c(st_pad, col, color)}  {idle:<{id_w}}  "
+                f"{task:<{task_w}}  {c(proc, '90', color)}")
+        out.append(line)
+
+    out.append("")
+    parts = []
+    for k in ("working", "waiting", "busy", "shell"):
+        if counts.get(k):
+            _, col, _ = STATUS_META[k]
+            parts.append(c(f"{counts[k]} {k}", col, color))
+    summary = f"{len(rows)} windows  —  " + "  ·  ".join(parts)
+    stamp = time.strftime("%-I:%M:%S %p")
+    out.append(summary + c(f"   ({stamp})", "90", color))
+    out.append(c("Tile them: deck tile   ·   jump to one: deck go <#>", "90", color))
+    return "\n".join(out) + "\n"
+
+
+# ---- html renderer -------------------------------------------------------
+def render_html(rows, refresh=None):
+    cards = []
+    palette = {
+        "working": ("#3ddc84", "WORKING"),
+        "waiting": ("#f2c14e", "WAITING"),
+        "busy":    ("#4dd0e1", "BUSY"),
+        "shell":   ("#8a8f98", "SHELL"),
+        "other":   ("#8a8f98", "—"),
+    }
+    counts = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+        color, label = palette.get(r["status"], palette["other"])
+        pulse = "pulse" if r["status"] in ("working", "busy") else ""
+        task = (r["task"].replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+        proc = (r["proc"].replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+        cards.append(f"""
+      <div class="card" style="--c:{color}">
+        <div class="top">
+          <span class="num">{r['n']}</span>
+          <span class="dot {pulse}"></span>
+          <span class="status">{label}</span>
+          <span class="idle">{fmt_idle(r['idle'])}</span>
+        </div>
+        <div class="task">{task}</div>
+        <div class="meta"><span class="proc">{proc}</span><span class="tty">{r['tty'].replace('/dev/','')}</span></div>
+      </div>""")
+
+    chips = []
+    for k in ("working", "waiting", "busy", "shell"):
+        if counts.get(k):
+            chips.append(f'<span class="chip" style="--c:{palette[k][0]}">'
+                         f'{counts[k]} {k}</span>')
+    meta_refresh = (f'<meta http-equiv="refresh" content="{refresh}">'
+                    if refresh else "")
+    stamp = time.strftime("%-I:%M:%S %p")
+    live = ('<span class="livedot"></span> live · every '
+            f'{refresh}s' if refresh else 'snapshot')
+
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+{meta_refresh}
+<title>deck — terminal windows</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 28px;
+    background: radial-gradient(1200px 800px at 70% -10%, #1b2330, #0c0f14 60%);
+    color: #e7eaf0;
+    font: 15px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }}
+  header {{ display:flex; align-items:baseline; flex-wrap:wrap; gap:14px; margin-bottom:22px; }}
+  h1 {{ font-size: 20px; margin:0; letter-spacing:.3px; font-weight:700; }}
+  h1 .accent {{ color:#6ea8fe; }}
+  .count {{ color:#8a8f98; }}
+  .chips {{ display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }}
+  .chip {{ border:1px solid color-mix(in srgb, var(--c) 55%, transparent);
+    color: var(--c); border-radius:999px; padding:3px 11px; font-size:12px; font-weight:600; }}
+  .live {{ color:#8a8f98; font-size:12px; display:flex; align-items:center; gap:6px; }}
+  .livedot {{ width:8px; height:8px; border-radius:50%; background:#3ddc84;
+    box-shadow:0 0 0 0 #3ddc84; animation:ping 1.6s infinite; }}
+  .grid {{ display:grid; gap:14px;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }}
+  .card {{
+    background: linear-gradient(180deg, #161b24, #11151c);
+    border:1px solid #232a35; border-left:4px solid var(--c);
+    border-radius:12px; padding:14px 16px;
+    box-shadow: 0 6px 18px rgba(0,0,0,.25);
+    transition: transform .12s ease, border-color .12s ease;
+  }}
+  .card:hover {{ transform: translateY(-2px); border-color:#3a4451; }}
+  .top {{ display:flex; align-items:center; gap:10px; margin-bottom:9px; }}
+  .num {{ background:#222b38; color:#9fb3c8; border-radius:7px;
+    min-width:26px; height:24px; display:inline-flex; align-items:center;
+    justify-content:center; font-weight:700; font-size:13px; padding:0 6px; }}
+  .dot {{ width:10px; height:10px; border-radius:50%; background:var(--c);
+    box-shadow:0 0 8px var(--c); }}
+  .dot.pulse {{ animation: ping 1.4s infinite; }}
+  .status {{ color:var(--c); font-weight:700; font-size:11px; letter-spacing:.6px; }}
+  .idle {{ margin-left:auto; color:#7b8290; font-size:12px; }}
+  .task {{ font-size:15.5px; font-weight:600; color:#f1f4f9; line-height:1.35;
+    margin:2px 0 11px; }}
+  .meta {{ display:flex; justify-content:space-between; align-items:center;
+    color:#7b8290; font-size:12px; }}
+  .proc {{ color:#9fb3c8; }}
+  .tty {{ opacity:.7; }}
+  footer {{ margin-top:22px; color:#5f6672; font-size:12px; }}
+  @keyframes ping {{
+    0% {{ box-shadow:0 0 0 0 color-mix(in srgb, var(--c, #3ddc84) 70%, transparent); }}
+    70% {{ box-shadow:0 0 0 9px transparent; }}
+    100% {{ box-shadow:0 0 0 0 transparent; }}
+  }}
+</style></head>
+<body>
+  <header>
+    <h1><span class="accent">▦</span> deck <span class="count">· {len(rows)} windows open</span></h1>
+    <div class="chips">{''.join(chips)}</div>
+  </header>
+  <div class="grid">{''.join(cards)}</div>
+  <footer>
+    <span class="live">{live}</span>
+    Updated {stamp} · jump in the terminal with <b>deck go &lt;#&gt;</b>
+  </footer>
+</body></html>"""
+
+
+# ---- window geometry -----------------------------------------------------
+def usable_area():
+    """Return (left, top, right, bottom) of the screen minus menu bar + Dock."""
+    try:
+        b = osa('tell application "Finder" to get bounds of window of desktop')
+        L, T, R, B = [int(x) for x in b.strip().split(", ")]
+    except Exception:
+        L, T, R, B = 0, 0, 1512, 982
+
+    top = T + 38          # menu bar (notch-safe)
+    left, right, bottom = L, R, B
+
+    # Dock: pull autohide / edge / size in one call
+    try:
+        p = osa('tell application "System Events" to tell dock preferences '
+                'to get {autohide, screen edge, dock size}')
+        fields = [f.strip() for f in p.strip().split(",")]
+        autohide = fields[0].lower() == "true"
+        edge = fields[1].lower()
+        try:
+            size = float(fields[2])
+        except (ValueError, IndexError):
+            size = 0.4
+    except Exception:
+        autohide, edge, size = False, "bottom", 0.4
+
+    if not autohide:
+        reserve = int(16 + size * 112) + 24    # dock tile px + padding
+        if edge == "bottom":
+            bottom -= reserve
+        elif edge == "left":
+            left += reserve
+        elif edge == "right":
+            right -= reserve
+    else:
+        bottom -= 6
+    return (left, top, right, bottom)
+
+
+def grid_cells(n, area, gap=8):
+    """Balanced, full-width grid. Returns n rectangles (l, t, r, b)."""
+    L, T, R, B = area
+    W, H = R - L, B - T
+    aspect = W / max(H, 1)
+    cols = max(1, round(math.sqrt(n * aspect)))
+    rows = max(1, math.ceil(n / cols))
+    base, extra = divmod(n, rows)
+    counts = [base + (1 if i < extra else 0) for i in range(rows)]
+    rh = H / rows
+    cells = []
+    for r, cnt in enumerate(counts):
+        cw = W / cnt
+        for ci in range(cnt):
+            l = L + ci * cw
+            t = T + r * rh
+            cells.append((round(l + gap / 2), round(t + gap / 2),
+                          round(l + cw - gap / 2), round(t + rh - gap / 2)))
+    return cells
+
+
+def fixed_grid_cells(n, area, cols, gap=8):
+    L, T, R, B = area
+    W, H = R - L, B - T
+    rows = max(1, math.ceil(n / cols))
+    rh = H / rows
+    cw = W / cols
+    cells = []
+    for i in range(n):
+        r, ci = divmod(i, cols)
+        l, t = L + ci * cw, T + r * rh
+        cells.append((round(l + gap / 2), round(t + gap / 2),
+                      round(l + cw - gap / 2), round(t + rh - gap / 2)))
+    return cells
+
+
+def cascade_cells(n, area, step=30):
+    """Diagonal stagger; wraps into a new column when it nears the bottom."""
+    L, T, R, B = area
+    win_w = min(760, R - L - 40)
+    win_h = min(460, B - T - 40)
+    cells = []
+    col_x, y = L, T
+    for i in range(n):
+        if y + win_h > B:                 # start a new diagonal column
+            col_x += win_w // 2
+            if col_x + win_w > R:
+                col_x = L
+            y = T
+        l, t = col_x, y
+        cells.append((l, t, l + win_w, t + win_h))
+        col_x += step
+        y += step
+    return cells
+
+
+def master_stack_cells(ids, master_id, area, master_frac=0.64, gap=8):
+    """Big 'master' pane on the left + the rest in a side stack.
+    Returns {window_id: (l, t, r, b)}."""
+    L, T, R, B = area
+    W, H = R - L, B - T
+    cells = {}
+    if len(ids) <= 1:
+        cells[master_id] = (round(L + gap / 2), round(T + gap / 2),
+                            round(R - gap / 2), round(B - gap / 2))
+        return cells
+
+    master_w = round(W * master_frac)
+    cells[master_id] = (round(L + gap / 2), round(T + gap / 2),
+                        round(L + master_w - gap / 2), round(B - gap / 2))
+
+    stack = [i for i in ids if i != master_id]
+    sx0, sw = L + master_w, W - master_w
+    scols = max(1, math.ceil(len(stack) / 8))   # 2nd column past 8 windows
+    srows = max(1, math.ceil(len(stack) / scols))
+    cw, ch = sw / scols, H / srows
+    for k, sid in enumerate(stack):
+        r, ci = divmod(k, scols)
+        l, t = sx0 + ci * cw, T + r * ch
+        cells[sid] = (round(l + gap / 2), round(t + gap / 2),
+                      round(l + cw - gap / 2), round(t + ch - gap / 2))
+    return cells
+
+
+def master_stack_slots(n, area, master_frac=0.64, gap=8):
+    """Positional slots: (master_rect, [stack_rect, ...]) with len == n-1.
+    Used by follow() so a click only SWAPS two windows between fixed slots."""
+    L, T, R, B = area
+    W, H = R - L, B - T
+    master = (round(L + gap / 2), round(T + gap / 2),
+              round(R - gap / 2 if n <= 1 else L + W * master_frac - gap / 2),
+              round(B - gap / 2))
+    if n <= 1:
+        return master, []
+    sx0, sw = L + W * master_frac, W - W * master_frac
+    ns = n - 1
+    scols = max(1, math.ceil(ns / 8))
+    srows = max(1, math.ceil(ns / scols))
+    cw, ch = sw / scols, H / srows
+    stack = []
+    for k in range(ns):
+        r, ci = divmod(k, scols)
+        l, t = sx0 + ci * cw, T + r * ch
+        stack.append((round(l + gap / 2), round(t + gap / 2),
+                      round(l + cw - gap / 2), round(t + ch - gap / 2)))
+    return master, stack
+
+
+def apply_bounds(rows, cells, master_id=None, activate=True):
+    """cells is either a parallel list (len == rows) or a {id: rect} dict."""
+    lines = ['tell application "Terminal"']
+    if activate:
+        lines.append("  activate")
+    if isinstance(cells, dict):
+        pairs = [(r["wid"], cells[r["wid"]]) for r in rows if r["wid"] in cells]
+    else:
+        pairs = [(r["wid"], rect) for r, rect in zip(rows, cells)]
+    for wid, (l, t, ri, b) in pairs:
+        lines.append(f"  set bounds of window id {wid} to "
+                     f"{{{l}, {t}, {ri}, {b}}}")
+    if master_id is not None:
+        lines.append(f"  set index of window id {master_id} to 1")
+    lines.append("end tell")
+    osa("\n".join(lines))
+
+
+def front_and_count():
+    """One cheap query: (front window id, window count)."""
+    out = osa('tell application "Terminal" to return '
+              '((id of front window) as string) & "/" & '
+              '((count of windows) as string)')
+    try:
+        a, b = out.strip().split("/")
+        return int(a), int(b)
+    except Exception:
+        return None, 0
+
+
+def do_tile(layout="grid", cols=None):
+    rows = collect()
+    if not rows:
+        print("No open Terminal windows to arrange.")
+        return 1
+    area = usable_area()
+    if layout == "stack":
+        cells = cascade_cells(len(rows), area)
+        how = "cascade"
+    elif cols:
+        cells = fixed_grid_cells(len(rows), area, cols)
+        how = f"{cols}-column grid"
+    else:
+        cells = grid_cells(len(rows), area)
+        how = "grid"
+    apply_bounds(rows, cells)
+    color = sys.stdout.isatty()
+    print(c(f"Arranged {len(rows)} Terminal windows into a {how}.", "92", color))
+    print(c("Numbered left-to-right, top-to-bottom — same as 'deck'. "
+            "Re-run after opening/closing windows.", "90", color))
+    return 0
+
+
+def do_main(n=None):
+    """One-shot: make window #n (or the current front window) the big master."""
+    rows = collect()
+    if not rows:
+        print("No open Terminal windows.")
+        return 1
+    if n is None:
+        fid, _ = front_and_count()
+        master = fid if any(r["wid"] == fid for r in rows) else rows[-1]["wid"]
+    else:
+        m = [r for r in rows if r["n"] == n]
+        if not m:
+            print(f"No window #{n} (there are {len(rows)}).")
+            return 1
+        master = m[0]["wid"]
+    cells = master_stack_cells([r["wid"] for r in rows], master, usable_area())
+    apply_bounds(rows, cells, master_id=master)
+    color = sys.stdout.isatty()
+    task = next(r["task"] for r in rows if r["wid"] == master)
+    print(c(f"Enlarged: {task}", "92", color))
+    print(c("The rest are stacked on the right — click any to swap it big "
+            "(or run 'deck follow' for automatic click-to-enlarge).",
+            "90", color))
+    return 0
+
+
+def _full_layout(master_frac):
+    """Lay every window into master+stack slots. Returns tracking state."""
+    rows = collect()
+    ids = [r["wid"] for r in rows]
+    if not ids:
+        return None
+    fid, _ = front_and_count()
+    master = fid if fid in ids else ids[0]
+    m_rect, s_rects = master_stack_slots(len(ids), usable_area(), master_frac)
+    stack_ids = [i for i in ids if i != master]
+    slot = {master: "M"}
+    cells = {master: m_rect}
+    for k, sid in enumerate(stack_ids):
+        slot[sid] = k
+        cells[sid] = s_rects[k]
+    apply_bounds(rows, cells, master_id=master, activate=False)
+    return {"slot": slot, "m_rect": m_rect, "s_rects": s_rects,
+            "master": master, "ids": set(ids)}
+
+
+def do_follow(master_frac=0.64, interval=0.25):
+    """Live loop: the window you click swaps into the big 'master' pane.
+    Only two windows move per click (clicked -> master, old master -> its slot)."""
+    color = sys.stdout.isatty()
+    print(c("● click-to-enlarge running — click any small window and it "
+            "swaps into the big pane.", "92", color))
+    st = _full_layout(master_frac)
+    while st is None:
+        time.sleep(1.0)
+        st = _full_layout(master_frac)
+    try:
+        while True:
+            fid, cnt = front_and_count()
+            if fid is None:
+                time.sleep(interval)
+                continue
+            # window opened/closed, or an untracked window came forward
+            if cnt != len(st["ids"]) or fid not in st["slot"]:
+                ns = _full_layout(master_frac)
+                if ns:
+                    st = ns
+                time.sleep(interval)
+                continue
+            if fid != st["master"]:
+                s = st["slot"][fid]            # stack slot the click vacates
+                old = st["master"]
+                st["slot"][fid] = "M"
+                st["slot"][old] = s
+                ml = st["m_rect"]
+                sl = st["s_rects"][s]
+                osa('tell application "Terminal"\n'
+                    f'  set bounds of window id {fid} to '
+                    f'{{{ml[0]}, {ml[1]}, {ml[2]}, {ml[3]}}}\n'
+                    f'  set bounds of window id {old} to '
+                    f'{{{sl[0]}, {sl[1]}, {sl[2]}, {sl[3]}}}\n'
+                    f'  set index of window id {fid} to 1\n'
+                    'end tell')
+                st["master"] = fid
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print(c("\nfollow stopped.", "90", color))
+
+
+# ---- background daemon control for follow --------------------------------
+def follow_pid():
+    try:
+        pid = int(open(PID_PATH).read().strip())
+        os.kill(pid, 0)            # probe: raises if not alive
+        return pid
+    except Exception:
+        return None
+
+
+def follow_start(master_frac=0.64):
+    pid = follow_pid()
+    if pid:
+        print(f"click-to-enlarge already ON (pid {pid}). "
+              "Stop it with: deck follow stop")
+        return 0
+    log = open(LOG_PATH, "a")
+    p = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "_followd", str(master_frac)],
+        stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        start_new_session=True)
+    with open(PID_PATH, "w") as f:
+        f.write(str(p.pid))
+    color = sys.stdout.isatty()
+    print(c("✓ click-to-enlarge is ON (running in the background).", "92", color))
+    print(c("  Click any small window — it swaps into the big pane you type in.",
+            "90", color))
+    print(c("  Turn off with:  deck follow stop", "90", color))
+    return 0
+
+
+def follow_stop():
+    pid = follow_pid()
+    if not pid:
+        print("click-to-enlarge is not running.")
+        try:
+            os.remove(PID_PATH)
+        except OSError:
+            pass
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        os.remove(PID_PATH)
+    except OSError:
+        pass
+    print("click-to-enlarge OFF. Windows stay where they are "
+          "(run 'deck tile' to re-grid).")
+    return 0
+
+
+def follow_status():
+    pid = follow_pid()
+    print(f"click-to-enlarge: ON (pid {pid})" if pid else "click-to-enlarge: OFF")
+    return 0
+
+
+# ---- actions -------------------------------------------------------------
+def do_go(n):
+    rows = collect()
+    match = [r for r in rows if r["n"] == n]
+    if not match:
+        print(f"No window #{n}. There are {len(rows)} open "
+              f"(run 'deck' to list them).")
+        return 1
+    wid = match[0]["wid"]
+    osa(f'''tell application "Terminal"
+      activate
+      set index of window id {wid} to 1
+    end tell''')
+    print(f"→ #{n}: {match[0]['task']}")
+    return 0
+
+
+def do_table_once(color):
+    sys.stdout.write(render_table(collect(), color))
+
+
+def do_watch(interval):
+    try:
+        while True:
+            sys.stdout.write("\033[2J\033[H")           # clear + home
+            sys.stdout.write(render_table(collect(), True))
+            sys.stdout.write(c("\n  ↻ live — every "
+                               f"{interval}s — Ctrl-C to stop", "90", True)
+                             + "\n")
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+
+
+def do_html(watch=False, interval=3):
+    def write_once():
+        rows = collect()
+        with open(HTML_PATH, "w", encoding="utf-8") as f:
+            f.write(render_html(rows, refresh=interval if watch else None))
+        return rows
+    rows = write_once()
+    subprocess.run(["open", HTML_PATH])
+    print(f"Dashboard → {HTML_PATH}  ({len(rows)} windows)")
+    if watch:
+        print(f"Live: regenerating every {interval}s, page auto-refreshes. "
+              "Ctrl-C to stop.")
+        try:
+            while True:
+                time.sleep(interval)
+                write_once()
+        except KeyboardInterrupt:
+            print("\nstopped.")
+
+
+HELP = __doc__
+
+
+def main():
+    args = sys.argv[1:]
+    color = sys.stdout.isatty()
+
+    if not args:
+        return do_table_once(color)
+
+    cmd = args[0].lower()
+    if cmd in ("help", "-h", "--help"):
+        print(HELP)
+    elif cmd in ("version", "-v", "--version"):
+        print(f"deck {VERSION}")
+    elif cmd == "go":
+        if len(args) < 2 or not args[1].isdigit():
+            print("Usage: deck go <number>")
+            return 1
+        return do_go(int(args[1]))
+    elif cmd in ("tile", "grid", "arrange"):
+        cols = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+        return do_tile("grid", cols)
+    elif cmd in ("stack", "cascade"):
+        return do_tile("stack")
+    elif cmd in ("follow", "live"):
+        sub = args[1].lower() if len(args) > 1 else ""
+        if sub in ("stop", "off"):
+            return follow_stop()
+        if sub == "status":
+            return follow_status()
+        if sub in ("fg", "--fg"):
+            do_follow()                       # blocking, in this tab
+        else:
+            mf = float(args[1]) / 100.0 if (len(args) > 1 and
+                                            args[1].isdigit()) else 0.64
+            return follow_start(mf)
+    elif cmd in ("unfollow", "stop"):
+        return follow_stop()
+    elif cmd == "_followd":                    # internal: daemon body
+        mf = float(args[1]) if len(args) > 1 else 0.64
+        do_follow(master_frac=mf)
+    elif cmd in ("main", "big", "focus"):
+        n = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+        return do_main(n)
+    elif cmd == "watch":
+        interval = (float(args[1]) if len(args) > 1 and
+                    args[1].replace(".", "", 1).isdigit() else 2.0)
+        do_watch(interval)
+    elif cmd == "html":
+        watch = len(args) > 1 and args[1].lower() == "watch"
+        do_html(watch=watch)
+    else:
+        print(f"Unknown command: {cmd}\n")
+        print(HELP)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
